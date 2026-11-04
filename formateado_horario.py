@@ -167,7 +167,7 @@ if("-multi" in ruta_raw):
 else:
     inicial_nombre = corte[-1].replace("-single", "")
 
-estilo = inicial_nombre + "_stylesheet.css"
+estilo = "stylesheet.css"
 
 # raw_estudiante =  r'D:\Liceo\Horarios 2021-2022\mayo 2022\estudiantesraw.html'
 # raw_profesores = r'D:\Liceo\Horarios 2021-2022\mayo 2022\profesoresraw.html'
