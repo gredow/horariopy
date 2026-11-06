@@ -3,11 +3,12 @@ from tkinter import ttk, filedialog, messagebox
 import sqlite3
 import os
 import io
+import re
 import numpy as np
 from pathlib import Path
 import xml.etree.ElementTree as ET
 import webbrowser
-import re
+from bs4 import BeautifulSoup
 
 
 class HorarioApp:
@@ -22,6 +23,8 @@ class HorarioApp:
         self.nombre_centro = tk.StringVar(value="Liceo Ana Elpidia Sánchez")
         self.ruta_fet = tk.StringVar()
         self.ruta_html_salida = tk.StringVar()
+        self.ruta_relleno_entrada = tk.StringVar()
+        self.ruta_relleno_salida = tk.StringVar()
 
         # Inicializar base de datos
         self.init_database()
@@ -38,12 +41,17 @@ class HorarioApp:
         self.xml_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.xml_tab, text="Gestión XML")
 
+        # Tab - Rellenado de Blancos
+        self.relleno_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.relleno_tab, text="Rellenado de Blancos")
+
         # Tab de datos
         self.data_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.data_tab, text="Datos de Configuración")
 
         self.create_main_tab()
         self.create_xml_tab()
+        self.create_relleno_tab()
         self.create_data_tab()
 
         # Cargar datos iniciales
@@ -66,6 +74,13 @@ class HorarioApp:
             )
         ''')
 
+        # Migración: agregar columnas nuevas si no existen (para bases de datos creadas antes)
+        for columna in ("ruta_relleno_entrada", "ruta_relleno_salida"):
+            try:
+                self.cursor.execute(f"ALTER TABLE config ADD COLUMN {columna} TEXT")
+            except sqlite3.OperationalError:
+                pass  # La columna ya existe
+
         # Crear tabla de profesores
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS profesores (
@@ -79,7 +94,10 @@ class HorarioApp:
     def load_data(self):
         """Cargar datos de la base de datos"""
         # Cargar configuración
-        self.cursor.execute("SELECT nombre_centro, ruta_raw, ruta_salvado, ruta_fet, ruta_html_salida FROM config LIMIT 1")
+        self.cursor.execute(
+            "SELECT nombre_centro, ruta_raw, ruta_salvado, ruta_fet, ruta_html_salida, "
+            "ruta_relleno_entrada, ruta_relleno_salida FROM config LIMIT 1"
+        )
         config = self.cursor.fetchone()
         if config:
             self.nombre_centro.set(config[0])
@@ -87,7 +105,9 @@ class HorarioApp:
             self.ruta_salvado.set(config[2] if config[2] else '')
             self.ruta_fet.set(config[3] if config[3] else '')
             self.ruta_html_salida.set(config[4] if config[4] else '')
-            
+            self.ruta_relleno_entrada.set(config[5] if config[5] else '')
+            self.ruta_relleno_salida.set(config[6] if config[6] else '')
+
             self.nombre_centro_entry.delete(0, tk.END)
             self.nombre_centro_entry.insert(0, config[0])
             self.ruta_raw_entry.delete(0, tk.END)
@@ -98,45 +118,42 @@ class HorarioApp:
             self.ruta_fet_entry.insert(0, config[3] if config[3] else '')
             self.ruta_html_salida_entry.delete(0, tk.END)
             self.ruta_html_salida_entry.insert(0, config[4] if config[4] else '')
+            self.ruta_relleno_entrada_entry.delete(0, tk.END)
+            self.ruta_relleno_entrada_entry.insert(0, config[5] if config[5] else '')
+            self.ruta_relleno_salida_entry.delete(0, tk.END)
+            self.ruta_relleno_salida_entry.insert(0, config[6] if config[6] else '')
 
         # Cargar profesores
         self.cursor.execute("SELECT nombre FROM profesores ORDER BY nombre")
         profesores = self.cursor.fetchall()
 
-        # Limpiar tabla
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        # Insertar profesores
         for prof in profesores:
             self.tree.insert('', 'end', values=(prof[0],))
 
     def create_main_tab(self):
         """Crear el tab principal para procesar horarios"""
-        # Frame para rutas
         frame_rutas = ttk.LabelFrame(self.main_tab, text="Configuración de Rutas", padding=10)
         frame_rutas.pack(fill='x', padx=10, pady=10)
 
-        # Ruta RAW
         ttk.Label(frame_rutas, text="Ruta RAW (FET Results):").grid(row=0, column=0, sticky='w', pady=5)
         self.ruta_raw_entry = ttk.Entry(frame_rutas, textvariable=self.ruta_raw, width=70)
         self.ruta_raw_entry.grid(row=0, column=1, padx=5, pady=5)
         ttk.Button(frame_rutas, text="Seleccionar", command=self.select_raw_folder).grid(row=0, column=2, padx=5, pady=5)
 
-        # Ruta Salvado
         ttk.Label(frame_rutas, text="Ruta de Destino:").grid(row=1, column=0, sticky='w', pady=5)
         self.ruta_salvado_entry = ttk.Entry(frame_rutas, textvariable=self.ruta_salvado, width=70)
         self.ruta_salvado_entry.grid(row=1, column=1, padx=5, pady=5)
         ttk.Button(frame_rutas, text="Seleccionar", command=self.select_save_folder).grid(row=1, column=2, padx=5, pady=5)
 
-        # Frame para botones de acción
         frame_accion = ttk.LabelFrame(self.main_tab, text="Acciones", padding=10)
         frame_accion.pack(fill='x', padx=10, pady=10)
 
         ttk.Button(frame_accion, text="Procesar Horarios", command=self.procesar_horarios,
                    style='Accent.TButton').pack(pady=10)
 
-        # Frame para logs
         frame_logs = ttk.LabelFrame(self.main_tab, text="Logs", padding=10)
         frame_logs.pack(fill='both', expand=True, padx=10, pady=10)
 
@@ -148,52 +165,46 @@ class HorarioApp:
         self.log_text.config(yscrollcommand=scrollbar.set)
         scrollbar.config(command=self.log_text.yview)
 
-        # Estilo para botón de acento
         style = ttk.Style()
         style.configure('Accent.TButton', font=('Helvetica', 10, 'bold'))
 
     def create_xml_tab(self):
         """Crear el tab para gestión de XML"""
-        # Frame para rutas
         frame_rutas = ttk.LabelFrame(self.xml_tab, text="Configuración de Archivos FET", padding=10)
         frame_rutas.pack(fill='x', padx=10, pady=10)
 
-        # Ruta del archivo FET
         ttk.Label(frame_rutas, text="Archivo FET (.fet):").grid(row=0, column=0, sticky='w', pady=5)
         self.ruta_fet_entry = ttk.Entry(frame_rutas, textvariable=self.ruta_fet, width=70)
         self.ruta_fet_entry.grid(row=0, column=1, padx=5, pady=5)
         ttk.Button(frame_rutas, text="Seleccionar", command=self.select_fet_file).grid(row=0, column=2, padx=5, pady=5)
 
-        # Ruta de salida HTML
         ttk.Label(frame_rutas, text="Ruta de Salida HTML:").grid(row=1, column=0, sticky='w', pady=5)
         self.ruta_html_salida_entry = ttk.Entry(frame_rutas, textvariable=self.ruta_html_salida, width=70)
         self.ruta_html_salida_entry.grid(row=1, column=1, padx=5, pady=5)
         ttk.Button(frame_rutas, text="Seleccionar", command=self.select_html_output_folder).grid(row=1, column=2, padx=5, pady=5)
 
-        # Frame para botones de acción
         frame_accion = ttk.LabelFrame(self.xml_tab, text="Acciones", padding=10)
         frame_accion.pack(fill='x', padx=10, pady=10)
 
         btn_frame = ttk.Frame(frame_accion)
         btn_frame.pack(pady=10)
 
-        ttk.Button(btn_frame, text="Generar Carga de Maestros", 
+        ttk.Button(btn_frame, text="Generar Carga de Maestros",
                    command=self.generar_carga_maestros,
                    style='Accent.TButton').pack(side='left', padx=10)
 
-        ttk.Button(btn_frame, text="Generar Restricciones Estudiantes", 
+        ttk.Button(btn_frame, text="Generar Restricciones Estudiantes",
                    command=self.generar_restricciones_estudiantes,
                    style='Accent.TButton').pack(side='left', padx=10)
 
-        ttk.Button(btn_frame, text="Generar Restricciones Profesores", 
+        ttk.Button(btn_frame, text="Generar Restricciones Profesores",
                    command=self.generar_restricciones_profesores,
                    style='Accent.TButton').pack(side='left', padx=10)
 
-        ttk.Button(btn_frame, text="Generar Todas las Restricciones", 
+        ttk.Button(btn_frame, text="Generar Todas las Restricciones",
                    command=self.generar_todas_restricciones,
                    style='Accent.TButton').pack(side='left', padx=10)
 
-        # Frame para logs XML
         frame_logs = ttk.LabelFrame(self.xml_tab, text="Logs", padding=10)
         frame_logs.pack(fill='both', expand=True, padx=10, pady=10)
 
@@ -205,9 +216,43 @@ class HorarioApp:
         self.xml_log_text.config(yscrollcommand=scrollbar.set)
         scrollbar.config(command=self.xml_log_text.yview)
 
+    def create_relleno_tab(self):
+        """Crear el tab para rellenado de blancos en HTML"""
+        frame_rutas = ttk.LabelFrame(self.relleno_tab, text="Archivos HTML", padding=10)
+        frame_rutas.pack(fill='x', padx=10, pady=10)
+
+        ttk.Label(frame_rutas, text="Archivo HTML de Entrada:").grid(row=0, column=0, sticky='w', pady=5)
+        self.ruta_relleno_entrada_entry = ttk.Entry(frame_rutas, textvariable=self.ruta_relleno_entrada, width=70)
+        self.ruta_relleno_entrada_entry.grid(row=0, column=1, padx=5, pady=5)
+        ttk.Button(frame_rutas, text="Seleccionar",
+                   command=self.select_relleno_entrada).grid(row=0, column=2, padx=5, pady=5)
+
+        ttk.Label(frame_rutas, text="Archivo HTML de Salida:").grid(row=1, column=0, sticky='w', pady=5)
+        self.ruta_relleno_salida_entry = ttk.Entry(frame_rutas, textvariable=self.ruta_relleno_salida, width=70)
+        self.ruta_relleno_salida_entry.grid(row=1, column=1, padx=5, pady=5)
+        ttk.Button(frame_rutas, text="Seleccionar",
+                   command=self.select_relleno_salida).grid(row=1, column=2, padx=5, pady=5)
+
+        frame_accion = ttk.LabelFrame(self.relleno_tab, text="Acciones", padding=10)
+        frame_accion.pack(fill='x', padx=10, pady=10)
+
+        ttk.Button(frame_accion, text="Ejecutar Rellenado",
+                   command=self.ejecutar_rellenado,
+                   style='Accent.TButton').pack(pady=10)
+
+        frame_logs = ttk.LabelFrame(self.relleno_tab, text="Logs", padding=10)
+        frame_logs.pack(fill='both', expand=True, padx=10, pady=10)
+
+        self.relleno_log_text = tk.Text(frame_logs, height=10, wrap='word')
+        self.relleno_log_text.pack(fill='both', expand=True)
+
+        scrollbar = ttk.Scrollbar(self.relleno_log_text)
+        scrollbar.pack(side='right', fill='y')
+        self.relleno_log_text.config(yscrollcommand=scrollbar.set)
+        scrollbar.config(command=self.relleno_log_text.yview)
+
     def create_data_tab(self):
         """Crear el tab de datos"""
-        # Frame para nombre del centro
         frame_centro = ttk.LabelFrame(self.data_tab, text="Nombre del Centro", padding=10)
         frame_centro.pack(fill='x', padx=10, pady=10)
 
@@ -216,11 +261,9 @@ class HorarioApp:
         self.nombre_centro_entry.pack(side='left', padx=5)
         ttk.Button(frame_centro, text="Guardar", command=self.guardar_centro).pack(side='left', padx=5)
 
-        # Frame para profesores
         frame_profesores = ttk.LabelFrame(self.data_tab, text="Lista de Profesores", padding=10)
         frame_profesores.pack(fill='both', expand=True, padx=10, pady=10)
 
-        # Frame para agregar profesor
         frame_agregar = ttk.Frame(frame_profesores)
         frame_agregar.pack(fill='x', pady=5)
 
@@ -231,7 +274,6 @@ class HorarioApp:
         ttk.Button(frame_agregar, text="Cargar Profesores por Defecto",
                    command=self.cargar_profesores_defecto).pack(side='left', padx=5)
 
-        # Tabla de profesores
         frame_tabla = ttk.Frame(frame_profesores)
         frame_tabla.pack(fill='both', expand=True, pady=5)
 
@@ -248,7 +290,6 @@ class HorarioApp:
         scrollbar_y.pack(side='right', fill='y')
         scrollbar_x.pack(side='bottom', fill='x')
 
-        # Botones para eliminar
         frame_botones = ttk.Frame(frame_profesores)
         frame_botones.pack(pady=5)
 
@@ -257,29 +298,27 @@ class HorarioApp:
         ttk.Button(frame_botones, text="Eliminar Todos",
                    command=self.eliminar_todos_profesores).pack(side='left', padx=5)
 
+    # ==================== SELECTORES DE RUTAS ====================
+
     def select_raw_folder(self):
-        """Seleccionar carpeta RAW"""
         folder = filedialog.askdirectory(title="Seleccionar carpeta RAW (FET Results)")
         if folder:
             self.ruta_raw.set(os.path.normpath(folder))
             self.guardar_configuracion()
 
     def select_save_folder(self):
-        """Seleccionar carpeta de destino"""
         folder = filedialog.askdirectory(title="Seleccionar carpeta de destino")
         if folder:
             self.ruta_salvado.set(os.path.normpath(folder))
             self.guardar_configuracion()
 
     def select_fet_file(self):
-        """Seleccionar archivo FET"""
         file = filedialog.askopenfilename(
             title="Seleccionar archivo FET",
             filetypes=[("FET files", "*.fet"), ("All files", "*.*")]
         )
         if file:
             self.ruta_fet.set(os.path.normpath(file))
-            # Auto-completar ruta de salida HTML
             if not self.ruta_html_salida.get():
                 directorio = os.path.dirname(file)
                 self.ruta_html_salida.set(directorio)
@@ -288,36 +327,66 @@ class HorarioApp:
             self.guardar_configuracion()
 
     def select_html_output_folder(self):
-        """Seleccionar carpeta de salida HTML"""
         folder = filedialog.askdirectory(title="Seleccionar carpeta de salida para HTML")
         if folder:
             self.ruta_html_salida.set(os.path.normpath(folder))
+            self.guardar_configuracion()
+
+    def select_relleno_entrada(self):
+        """Seleccionar archivo HTML de entrada para rellenado"""
+        file = filedialog.askopenfilename(
+            title="Seleccionar archivo HTML de entrada",
+            filetypes=[("HTML files", "*.html *.htm"), ("All files", "*.*")]
+        )
+        if file:
+            self.ruta_relleno_entrada.set(os.path.normpath(file))
+            # Auto-sugerir ruta de salida si está vacía o es la misma carpeta
+            if not self.ruta_relleno_salida.get():
+                directorio = os.path.dirname(file)
+                nombre_base = os.path.splitext(os.path.basename(file))[0]
+                salida_sugerida = os.path.join(directorio, f"{nombre_base}_modificado.html")
+                self.ruta_relleno_salida.set(salida_sugerida)
+                self.ruta_relleno_salida_entry.delete(0, tk.END)
+                self.ruta_relleno_salida_entry.insert(0, salida_sugerida)
+            self.guardar_configuracion()
+
+    def select_relleno_salida(self):
+        """Seleccionar archivo HTML de salida para rellenado"""
+        file = filedialog.asksaveasfilename(
+            title="Guardar archivo HTML de salida",
+            defaultextension=".html",
+            filetypes=[("HTML files", "*.html *.htm"), ("All files", "*.*")]
+        )
+        if file:
+            self.ruta_relleno_salida.set(os.path.normpath(file))
             self.guardar_configuracion()
 
     def guardar_configuracion(self):
         """Guardar configuración en la base de datos"""
         try:
             self.cursor.execute('''
-                INSERT OR REPLACE INTO config (id, nombre_centro, ruta_raw, ruta_salvado, ruta_fet, ruta_html_salida)
-                VALUES (1, ?, ?, ?, ?, ?)
-            ''', (self.nombre_centro.get(), self.ruta_raw.get(), self.ruta_salvado.get(), 
-                  self.ruta_fet.get(), self.ruta_html_salida.get()))
+                INSERT OR REPLACE INTO config 
+                (id, nombre_centro, ruta_raw, ruta_salvado, ruta_fet, ruta_html_salida,
+                 ruta_relleno_entrada, ruta_relleno_salida)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+            ''', (self.nombre_centro.get(), self.ruta_raw.get(), self.ruta_salvado.get(),
+                  self.ruta_fet.get(), self.ruta_html_salida.get(),
+                  self.ruta_relleno_entrada.get(), self.ruta_relleno_salida.get()))
             self.conn.commit()
         except Exception as e:
             messagebox.showerror("Error", f"Error al guardar configuración: {str(e)}")
 
     def guardar_centro(self):
-        """Guardar solo el nombre del centro"""
         self.guardar_configuracion()
         messagebox.showinfo("Éxito", "Nombre del centro guardado correctamente")
 
+    # ==================== GESTIÓN DE PROFESORES ====================
+
     def agregar_profesor(self):
-        """Agregar un profesor a la base de datos"""
         nombre = self.nuevo_profesor_entry.get().strip()
         if not nombre:
             messagebox.showwarning("Advertencia", "Ingrese un nombre de profesor")
             return
-
         try:
             self.cursor.execute("INSERT INTO profesores (nombre) VALUES (?)", (nombre,))
             self.conn.commit()
@@ -330,12 +399,10 @@ class HorarioApp:
             messagebox.showerror("Error", f"Error al agregar profesor: {str(e)}")
 
     def eliminar_profesor(self):
-        """Eliminar el profesor seleccionado"""
         selected = self.tree.selection()
         if not selected:
             messagebox.showwarning("Advertencia", "Seleccione un profesor para eliminar")
             return
-
         if messagebox.askyesno("Confirmar", "¿Está seguro de eliminar el profesor seleccionado?"):
             nombre = self.tree.item(selected[0])['values'][0]
             try:
@@ -347,7 +414,6 @@ class HorarioApp:
                 messagebox.showerror("Error", f"Error al eliminar profesor: {str(e)}")
 
     def eliminar_todos_profesores(self):
-        """Eliminar todos los profesores"""
         if messagebox.askyesno("Confirmar", "¿Está seguro de eliminar todos los profesores?"):
             try:
                 self.cursor.execute("DELETE FROM profesores")
@@ -358,7 +424,6 @@ class HorarioApp:
                 messagebox.showerror("Error", f"Error al eliminar profesores: {str(e)}")
 
     def cargar_profesores_defecto(self):
-        """Cargar la lista de profesores por defecto"""
         profesores_defecto = [
             "Eddy Wilson Díaz Sánchez", "Miguelina Díaz", "Franny Reyemic Ramirez De Fernández",
             "Johanna Altagracia Pujols de Feliz", "Leandro Díaz Díaz", "Navidad Del Jesús Sánchez Sánchez",
@@ -379,7 +444,6 @@ class HorarioApp:
             "PROF. EDUCACIÓN FISICA", "PROF. FRANCÉS", "PROF. TALLERES 1", "PROF. TALLERES 2",
             "MARÍA NICAURIS MÉNDEZ"
         ]
-
         if messagebox.askyesno("Confirmar", "¿Desea cargar los profesores por defecto? (Se eliminarán los actuales)"):
             try:
                 self.cursor.execute("DELETE FROM profesores")
@@ -392,44 +456,45 @@ class HorarioApp:
                 messagebox.showerror("Error", f"Error al cargar profesores: {str(e)}")
 
     def get_profesores_from_db(self):
-        """Obtener la lista de profesores de la base de datos"""
         self.cursor.execute("SELECT nombre FROM profesores ORDER BY nombre")
         return [row[0] for row in self.cursor.fetchall()]
 
+    # ==================== LOGS ====================
+
+    def log_message(self, message):
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+        self.root.update()
+
+    def xml_log_message(self, message):
+        self.xml_log_text.insert(tk.END, message + "\n")
+        self.xml_log_text.see(tk.END)
+        self.root.update()
+
+    def relleno_log_message(self, message):
+        self.relleno_log_text.insert(tk.END, message + "\n")
+        self.relleno_log_text.see(tk.END)
+        self.root.update()
+
+    # ==================== PROCESAMIENTO DE HORARIOS ====================
+
     def replace_brake(self, miarray, hora, texto):
-        """Reemplazar los marcadores -X- con el texto correspondiente"""
         p = [i for i, item in enumerate(miarray) if hora in item]
         for m in p:
             for i in range(1, 6):
                 if m + i < len(miarray):
                     miarray[m + i] = miarray[m + i].replace('-X-', texto)
 
-    def log_message(self, message):
-        """Agregar mensaje al log principal"""
-        self.log_text.insert(tk.END, message + "\n")
-        self.log_text.see(tk.END)
-        self.root.update()
-
-    def xml_log_message(self, message):
-        """Agregar mensaje al log XML"""
-        self.xml_log_text.insert(tk.END, message + "\n")
-        self.xml_log_text.see(tk.END)
-        self.root.update()
-
     def obtener_nombre_inicial(self, ruta_raw):
-        """Obtener el nombre inicial del archivo a partir de la ruta"""
         ruta_normalizada = os.path.normpath(ruta_raw)
         nombre_carpeta = os.path.basename(ruta_normalizada)
-
         if "-multi" in nombre_carpeta:
             inicial_nombre = nombre_carpeta.replace("-multi", "")
         else:
             inicial_nombre = nombre_carpeta.replace("-single", "")
-
         return inicial_nombre
 
     def procesar_horarios(self):
-        """Procesar los horarios"""
         if not self.ruta_raw.get():
             messagebox.showerror("Error", "Seleccione la ruta RAW")
             return
@@ -446,14 +511,13 @@ class HorarioApp:
             nombre_centro = self.nombre_centro.get()
             ruta_raw = os.path.normpath(self.ruta_raw.get())
             ruta_salvado = os.path.normpath(self.ruta_salvado.get())
-
             inicial_nombre = self.obtener_nombre_inicial(ruta_raw)
 
             self.log_message(f"Ruta RAW: {ruta_raw}")
             self.log_message(f"Ruta Destino: {ruta_salvado}")
-            self.log_message(f"Nombre inicial:stylesh {inicial_nombre}")
+            self.log_message(f"Nombre inicial: {inicial_nombre}")
 
-            estilo = "styles.css"
+            estilo = inicial_nombre + "_stylesheet.css"
 
             raw_estudiante = os.path.join(ruta_raw, f"{inicial_nombre}_subgroups_days_horizontal.html")
             raw_profesores = os.path.join(ruta_raw, f"{inicial_nombre}_teachers_days_horizontal.html")
@@ -463,8 +527,7 @@ class HorarioApp:
 
             if not os.path.exists(raw_estudiante):
                 import glob
-                patron_estudiantes = os.path.join(ruta_raw, "*_subgroups_days_horizontal.html")
-                archivos_encontrados = glob.glob(patron_estudiantes)
+                archivos_encontrados = glob.glob(os.path.join(ruta_raw, "*_subgroups_days_horizontal.html"))
                 if archivos_encontrados:
                     raw_estudiante = archivos_encontrados[0]
                     self.log_message(f"Archivo de estudiantes encontrado: {raw_estudiante}")
@@ -474,8 +537,7 @@ class HorarioApp:
 
             if not os.path.exists(raw_profesores):
                 import glob
-                patron_profesores = os.path.join(ruta_raw, "*_teachers_days_horizontal.html")
-                archivos_encontrados = glob.glob(patron_profesores)
+                archivos_encontrados = glob.glob(os.path.join(ruta_raw, "*_teachers_days_horizontal.html"))
                 if archivos_encontrados:
                     raw_profesores = archivos_encontrados[0]
                     self.log_message(f"Archivo de profesores encontrado: {raw_profesores}")
@@ -498,7 +560,6 @@ class HorarioApp:
             self.log_message(f"ERROR: {str(e)}")
 
     def dividir2(self, archivo, nombre, ruta_salvado, nombre_css, tipo, nombres_profesores, nombre_centro):
-        """Función principal de procesamiento de archivos"""
         try:
             with io.open(archivo, encoding='utf-8') as f:
                 lineas = f.readlines()
@@ -524,7 +585,6 @@ class HorarioApp:
             g = g.replace('NORMAL', '').replace('SALIDA', '<BR>SALIDA').replace('TALLER', '<BR>TALLER')
             # Reemplaza CUALQUIER href que termine en _stylesheet.css por styles.css
             g = re.sub(r'href="[^"]*_stylesheet\.css"', 'href="styles.css"', g, flags=re.IGNORECASE)
-            # Fallback por si el nombre no coincide con el patrón
             g = g.replace(nombre_css, 'styles.css')
             g = g.replace(r'<p class="back"><a href="#top">Volver al principio</a></p>', '')
             g = g.replace('</table>', '</table> salto777')
@@ -532,12 +592,6 @@ class HorarioApp:
             g = g.replace(f'<caption>{nombre_centro}</caption>', '')
 
             reemplazos_hora = [
-                # ("03:05", "03:05<br>04:00"),
-                # ("02:50", "02:50<br>03:05"),
-                ("3:05", "03:05<br>04:00"),
-                ("2:50", "02:50<br>03:05"),
-                ("01:55", "01:55<br>02:50"),
-                ("01:00", "01:00<br>01:55"),
                 ("03:15", "03:15<br>04:00"),
                 ("02:30", "02:30<br>03:15"),
                 ("02:15", "02:15<br>02:30"),
@@ -549,7 +603,7 @@ class HorarioApp:
                 ("10:15", "10:15<br>11:00"),
                 ("09:45", "09:45<br>10:15"),
                 ("09:00", "09:00<br>09:45"),
-                ("08:15", "08:15<br>09:00"),
+                ("08:15", "08:15<br>09:00")
             ]
 
             for old, new in reemplazos_hora:
@@ -558,7 +612,6 @@ class HorarioApp:
             a = np.array(g.split('\n'))
 
             self.replace_brake(a, '9:45', 'RECREO')
-            self.replace_brake(a, '2:50', 'RECESO')
             self.replace_brake(a, '11:45', 'ALMUERZO')
             self.replace_brake(a, '2:15', 'RECESO')
             self.replace_brake(a, '3:15', 'TALLER')
@@ -586,12 +639,10 @@ class HorarioApp:
     # ==================== FUNCIONES DE GESTIÓN XML ====================
 
     def obtener_datos_fet(self):
-        """Obtener y validar los datos del archivo FET"""
         ruta_fet = self.ruta_fet.get()
         if not ruta_fet:
             messagebox.showerror("Error", "Seleccione un archivo FET")
             return None, None
-        
         if not os.path.exists(ruta_fet):
             messagebox.showerror("Error", f"No se encuentra el archivo: {ruta_fet}")
             return None, None
@@ -606,14 +657,11 @@ class HorarioApp:
         return ruta_fet, ruta_html
 
     def generar_carga_maestros(self):
-        """Generar el HTML de carga de maestros"""
         ruta_fet, ruta_html = self.obtener_datos_fet()
         if not ruta_fet:
             return
-
         try:
             self.xml_log_message("Generando carga de maestros...")
-            
             tree = ET.parse(ruta_fet)
             root = tree.getroot()
 
@@ -632,31 +680,26 @@ class HorarioApp:
                     students = activity.find(".//Students").text
                     total_duration = int(activity.find(".//Total_Duration").text)
                     teachers[teacher_name].append({
-                        'subject': subject, 
-                        'activity_tag': activity_tag, 
-                        'students': students,
-                        'total_duration': total_duration
+                        'subject': subject, 'activity_tag': activity_tag,
+                        'students': students, 'total_duration': total_duration
                     })
 
             html = "<html>\n<head>\n"
             html += '<title>Liceo Ana Elpidia Sánchez</title>\n'
             html += '<link rel="stylesheet" media="all" href="estilo_carga_maestros.css" type="text/css" />\n'
-            html += "</head>\n<body>\n"
-            html += "<table>\n"
+            html += "</head>\n<body>\n<table>\n"
             html += "\t<tr>\n\t\t<th>Maestros</th>\n\t\t<th>Asignaturas</th>\n\t\t<th>Horas Totales</th>\n\t</tr>\n"
 
             for teacher, subjects in teachers.items():
                 html += "\t<tr>\n"
-                html += f"\t\t<td>{teacher}</td>\n"
-                html += "\t\t<td>\n\t\t\t<ul>\n"
+                html += f"\t\t<td>{teacher}</td>\n\t\t<td>\n\t\t\t<ul>\n"
                 horas = 0
                 for subject in subjects:
                     horas += subject['total_duration']
                     subject_info = f"{subject['subject']}, {subject['activity_tag']}, {subject['students']}, {subject['total_duration']} horas"
                     html += f"\t\t\t\t<li>{subject_info}</li>\n"
                 html += "\t\t\t</ul>\n\t\t</td>\n"
-                html += f"\t\t<td>{horas} Horas</td>\n"
-                html += "\t</tr>\n"
+                html += f"\t\t<td>{horas} Horas</td>\n\t</tr>\n"
 
             html += "</table>\n</body>\n</html>"
 
@@ -666,232 +709,201 @@ class HorarioApp:
 
             self.xml_log_message(f"✅ Carga de maestros generada en: {archivo_html}")
             messagebox.showinfo("Éxito", f"Archivo generado: {archivo_html}")
-            
-            # Abrir el archivo en el navegador
             webbrowser.open(archivo_html)
-
         except Exception as e:
             self.xml_log_message(f"❌ Error: {str(e)}")
             messagebox.showerror("Error", f"Error al generar carga de maestros: {str(e)}")
 
+    def _construir_restricciones(self, ruta_fet, por_profesor=False):
+        """Construye el dict de restricciones a partir del FET. Reutilizable."""
+        tree = ET.parse(ruta_fet)
+        root = tree.getroot()
+
+        if por_profesor:
+            lista = [t[0].text for t in root.find(".//Teachers_List").findall(".//Teacher")]
+        else:
+            lista = [s[0].text for s in root.find(".//Students_List").findall(".//Subgroup")]
+
+        activities = {}
+        for activity in root.findall(".//Activity"):
+            teachers_list = [t.text for t in activity.findall(".//Teacher")]
+            c = len(teachers_list)
+            activities[int(activity[6 + c - 1].text)] = {
+                'teachers': teachers_list,
+                'subject': activity[1 + c - 1].text,
+                'students': activity[3 + c - 1].text,
+                'duration': int(activity[4 + c - 1].text),
+            }
+
+        restricciones_dict = {x: [] for x in lista}
+
+        for constraint in root.findall(".//ConstraintActivityPreferredStartingTimes"):
+            activity_id = int(constraint[1].text)
+            active = constraint[-2]
+            if active.text != 'true':
+                continue
+            data = activities.get(activity_id)
+            if not data:
+                continue
+
+            dias = []
+            for pst in constraint.findall(".//Preferred_Starting_Time"):
+                dia = pst[0].text
+                if dia not in dias:
+                    dias.append(dia)
+
+            clave = 'O'
+            if set(['Lunes', 'Martes', 'Miércoles', 'Jueves']).issubset(dias):
+                clave = 'L-J' if 'Viernes' not in dias else 'L-V'
+
+            if por_profesor:
+                for t in data['teachers']:
+                    restricciones_dict[t].append({
+                        'subject': data['subject'], 'students': data['students'],
+                        'duration': data['duration'], 'clave_dias': clave
+                    })
+            else:
+                restricciones_dict[data['students']].append({
+                    'subject': data['subject'], 'teachers': data['teachers'],
+                    'duration': data['duration'], 'clave_dias': clave
+                })
+
+        key = 'students' if por_profesor else 'subject'
+        for x in lista:
+            restricciones_dict[x] = sorted(restricciones_dict[x], key=lambda m: (m['clave_dias'], m[key]))
+        return restricciones_dict
+
     def generar_restricciones_estudiantes(self):
-        """Generar restricciones por estudiantes"""
         ruta_fet, ruta_html = self.obtener_datos_fet()
         if not ruta_fet:
             return
-
         try:
             self.xml_log_message("Generando restricciones por estudiantes...")
-            
-            tree = ET.parse(ruta_fet)
-            root = tree.getroot()
+            dict_restric = self._construir_restricciones(ruta_fet, por_profesor=False)
 
-            # Obtener todos los estudiantes
-            all_students = []
-            for subgroup in root.find(".//Students_List").findall(".//Subgroup"):
-                all_students.append(subgroup[0].text)
-
-            # Obtener actividades
-            activities = {}
-            for activity in root.findall(".//Activity"):
-                teachers_list = []
-                for teacher in activity.findall(".//Teacher"):
-                    teachers_list.append(teacher.text)
-                cantidad = len(teachers_list)
-                activities[int(activity[6 + cantidad - 1].text)] = {
-                    'activity_group_id': int(activity[7 + cantidad - 1].text),
-                    'teachers': teachers_list,
-                    'subject': activity[1 + cantidad - 1].text,
-                    'students': activity[3 + cantidad - 1].text,
-                    'activity_tag': activity[2 + cantidad - 1].text,
-                    'duration': int(activity[4 + cantidad - 1].text),
-                    'active': activity[8 + cantidad - 1].text
-                }
-
-            # Procesar restricciones
-            restricciones_dict = {student: [] for student in all_students}
-            
-            for constraint in root.findall(".//ConstraintActivityPreferredStartingTimes"):
-                activity_id = int(constraint[1].text)
-                active = constraint[-2]
-                
-                if active.text == 'true':
-                    activity_data = activities.get(activity_id)
-                    if activity_data:
-                        times = []
-                        for preferred_starting_time in constraint.findall(".//Preferred_Starting_Time"):
-                            times.append([preferred_starting_time[0].text, preferred_starting_time[1].text])
-                        
-                        dias_unicos = []
-                        for horario_item in times:
-                            dia = horario_item[0]
-                            if dia not in dias_unicos:
-                                dias_unicos.append(dia)
-                        
-                        clave_dias = 'O'
-                        if set(['Lunes', 'Martes', 'Miércoles', 'Jueves']).issubset(dias_unicos):
-                            if 'Viernes' not in dias_unicos:
-                                clave_dias = 'L-J'
-                            else:
-                                clave_dias = 'L-V'
-                        
-                        restricciones_dict[activity_data['students']].append({
-                            'subject': activity_data['subject'],
-                            'teachers': activity_data['teachers'],
-                            'duration': activity_data['duration'],
-                            'clave_dias': clave_dias
-                        })
-
-            # Ordenar
-            for student in all_students:
-                restricciones_dict[student] = sorted(restricciones_dict[student], 
-                                                      key=lambda x: (x['clave_dias'], x['subject']))
-
-            # Generar HTML
             html = ""
-            for student, materias in restricciones_dict.items():
-                html += f'<h1>{student}</h1>\n'
-                html += '<table border="1">\n'
+            for student, materias in dict_restric.items():
+                html += f'<h1>{student}</h1>\n<table border="1">\n'
                 html += '<tr><th>Materia</th><th>Profesor</th><th>Duración</th><th>Días</th><th>Sum L-J</th><th>Sum L-V</th></tr>\n'
-                sum_l_j = 0
-                sum_l_v = 0
-
-                for materia in materias:
-                    teacher = ', '.join(materia["teachers"])
-                    if materia["clave_dias"] == 'L-J':
-                        sum_l_j += materia["duration"]
-                    if materia["clave_dias"] == 'L-V':
-                        sum_l_v += materia["duration"]
-                    html += f'<tr><td>{materia["subject"]}</td><td>{teacher}</td><td>{materia["duration"]} horas</td>'
-                    html += f'<td>{materia["clave_dias"]}</td><td>{sum_l_j}</td><td>{sum_l_v}</td></tr>\n'
+                s_lj = s_lv = 0
+                for m in materias:
+                    if m["clave_dias"] == 'L-J': s_lj += m["duration"]
+                    if m["clave_dias"] == 'L-V': s_lv += m["duration"]
+                    html += f'<tr><td>{m["subject"]}</td><td>{", ".join(m["teachers"])}</td>'
+                    html += f'<td>{m["duration"]} horas</td><td>{m["clave_dias"]}</td><td>{s_lj}</td><td>{s_lv}</td></tr>\n'
                 html += '</table>\n'
 
             archivo_html = os.path.join(ruta_html, "restricciones-estudiantes.html")
             with open(archivo_html, "w", encoding='utf-8') as f:
                 f.write(html)
-
-            self.xml_log_message(f"✅ Restricciones por estudiantes generadas en: {archivo_html}")
+            self.xml_log_message(f"✅ Restricciones estudiantes: {archivo_html}")
             messagebox.showinfo("Éxito", f"Archivo generado: {archivo_html}")
             webbrowser.open(archivo_html)
-
         except Exception as e:
             self.xml_log_message(f"❌ Error: {str(e)}")
-            messagebox.showerror("Error", f"Error al generar restricciones: {str(e)}")
+            messagebox.showerror("Error", f"Error: {str(e)}")
 
     def generar_restricciones_profesores(self):
-        """Generar restricciones por profesores"""
         ruta_fet, ruta_html = self.obtener_datos_fet()
         if not ruta_fet:
             return
-
         try:
             self.xml_log_message("Generando restricciones por profesores...")
-            
-            tree = ET.parse(ruta_fet)
-            root = tree.getroot()
+            dict_restric = self._construir_restricciones(ruta_fet, por_profesor=True)
 
-            # Obtener todos los profesores
-            all_teachers = []
-            for teacher in root.find(".//Teachers_List").findall(".//Teacher"):
-                all_teachers.append(teacher[0].text)
-
-            # Obtener actividades
-            activities = {}
-            for activity in root.findall(".//Activity"):
-                teachers_list = []
-                for teacher in activity.findall(".//Teacher"):
-                    teachers_list.append(teacher.text)
-                cantidad = len(teachers_list)
-                activities[int(activity[6 + cantidad - 1].text)] = {
-                    'activity_group_id': int(activity[7 + cantidad - 1].text),
-                    'teachers': teachers_list,
-                    'subject': activity[1 + cantidad - 1].text,
-                    'students': activity[3 + cantidad - 1].text,
-                    'activity_tag': activity[2 + cantidad - 1].text,
-                    'duration': int(activity[4 + cantidad - 1].text),
-                    'active': activity[8 + cantidad - 1].text
-                }
-
-            # Procesar restricciones
-            restricciones_dict = {teacher: [] for teacher in all_teachers}
-            
-            for constraint in root.findall(".//ConstraintActivityPreferredStartingTimes"):
-                activity_id = int(constraint[1].text)
-                active = constraint[-2]
-                
-                if active.text == 'true':
-                    activity_data = activities.get(activity_id)
-                    if activity_data:
-                        times = []
-                        for preferred_starting_time in constraint.findall(".//Preferred_Starting_Time"):
-                            times.append([preferred_starting_time[0].text, preferred_starting_time[1].text])
-                        
-                        dias_unicos = []
-                        for horario_item in times:
-                            dia = horario_item[0]
-                            if dia not in dias_unicos:
-                                dias_unicos.append(dia)
-                        
-                        clave_dias = 'O'
-                        if set(['Lunes', 'Martes', 'Miércoles', 'Jueves']).issubset(dias_unicos):
-                            if 'Viernes' not in dias_unicos:
-                                clave_dias = 'L-J'
-                            else:
-                                clave_dias = 'L-V'
-                        
-                        for teacher in activity_data['teachers']:
-                            restricciones_dict[teacher].append({
-                                'subject': activity_data['subject'],
-                                'students': activity_data['students'],
-                                'duration': activity_data['duration'],
-                                'clave_dias': clave_dias
-                            })
-
-            # Ordenar
-            for teacher in all_teachers:
-                restricciones_dict[teacher] = sorted(restricciones_dict[teacher], 
-                                                      key=lambda x: (x['clave_dias'], x['students']))
-
-            # Generar HTML
             html = ""
-            for teacher, materias in restricciones_dict.items():
-                html += f'<h1>{teacher}</h1>\n'
-                html += '<table border="1">\n'
+            for teacher, materias in dict_restric.items():
+                html += f'<h1>{teacher}</h1>\n<table border="1">\n'
                 html += '<tr><th>Materia</th><th>Curso</th><th>Duración</th><th>Días</th><th>Sum L-J</th><th>Sum L-V</th></tr>\n'
-                sum_l_j = 0
-                sum_l_v = 0
-
-                for materia in materias:
-                    if materia["clave_dias"] == 'L-J':
-                        sum_l_j += materia["duration"]
-                    if materia["clave_dias"] == 'L-V':
-                        sum_l_v += materia["duration"]
-                    html += f'<tr><td>{materia["subject"]}</td><td>{materia["students"]}</td><td>{materia["duration"]} horas</td>'
-                    html += f'<td>{materia["clave_dias"]}</td><td>{sum_l_j}</td><td>{sum_l_v}</td></tr>\n'
+                s_lj = s_lv = 0
+                for m in materias:
+                    if m["clave_dias"] == 'L-J': s_lj += m["duration"]
+                    if m["clave_dias"] == 'L-V': s_lv += m["duration"]
+                    html += f'<tr><td>{m["subject"]}</td><td>{m["students"]}</td>'
+                    html += f'<td>{m["duration"]} horas</td><td>{m["clave_dias"]}</td><td>{s_lj}</td><td>{s_lv}</td></tr>\n'
                 html += '</table>\n'
 
             archivo_html = os.path.join(ruta_html, "restricciones-profesores.html")
             with open(archivo_html, "w", encoding='utf-8') as f:
                 f.write(html)
-
-            self.xml_log_message(f"✅ Restricciones por profesores generadas en: {archivo_html}")
+            self.xml_log_message(f"✅ Restricciones profesores: {archivo_html}")
             messagebox.showinfo("Éxito", f"Archivo generado: {archivo_html}")
             webbrowser.open(archivo_html)
-
         except Exception as e:
             self.xml_log_message(f"❌ Error: {str(e)}")
-            messagebox.showerror("Error", f"Error al generar restricciones: {str(e)}")
+            messagebox.showerror("Error", f"Error: {str(e)}")
 
     def generar_todas_restricciones(self):
-        """Generar todas las restricciones"""
         self.generar_carga_maestros()
         self.generar_restricciones_estudiantes()
         self.generar_restricciones_profesores()
         self.xml_log_message("✅ Todas las restricciones generadas correctamente")
         messagebox.showinfo("Éxito", "Todas las restricciones generadas correctamente")
 
+    # ==================== RELLENADO DE BLANCOS ====================
+
+    def ejecutar_rellenado(self):
+        """Ejecuta el relleno de celdas vacías (--- / -x-) en el HTML"""
+        file = self.ruta_relleno_entrada.get()
+        file_salida = self.ruta_relleno_salida.get()
+
+        if not file:
+            messagebox.showerror("Error", "Seleccione el archivo HTML de entrada")
+            return
+        if not file_salida:
+            messagebox.showerror("Error", "Seleccione el archivo HTML de salida")
+            return
+        if not os.path.exists(file):
+            messagebox.showerror("Error", f"No se encuentra el archivo de entrada:\n{file}")
+            return
+
+        try:
+            self.relleno_log_message(f"📄 Entrada: {file}")
+            self.relleno_log_message(f"💾 Salida : {file_salida}")
+
+            with open(file, 'r', encoding='utf-8') as f:
+                soup = BeautifulSoup(f, 'html.parser')
+
+            tables = soup.find_all('table')
+            self.relleno_log_message(f"🔎 Tablas encontradas: {len(tables)}")
+
+            total_reemplazos = 0
+            for idx, table in enumerate(tables, start=1):
+                tbody = table.find('tbody')
+                rows = tbody.find_all('tr') if tbody else table.find_all('tr')
+
+                replaced_meeting = False
+                alternator = 0
+
+                for row in rows:
+                    cells = row.find_all('td')
+                    for i, cell in enumerate(cells):
+                        if cell.text.strip() in ("---", "-x-"):
+                            if i == len(cells) - 1 and not replaced_meeting:
+                                cell.string = "Reunión con Padres"
+                                replaced_meeting = True
+                            else:
+                                cell.string = "Planificación" if alternator % 2 == 0 else "Trabajo de Registro"
+                                alternator += 1
+                            total_reemplazos += 1
+
+            # Asegurar que existe el directorio de salida
+            directorio_salida = os.path.dirname(file_salida)
+            if directorio_salida:
+                os.makedirs(directorio_salida, exist_ok=True)
+
+            with open(file_salida, 'w', encoding='utf-8') as f:
+                f.write(str(soup))
+
+            self.relleno_log_message(f"✅ Celdas reemplazadas: {total_reemplazos}")
+            self.relleno_log_message(f"✅ Archivo generado: {file_salida}")
+            messagebox.showinfo("Éxito", f"HTML procesado correctamente.\n\nCeldas reemplazadas: {total_reemplazos}\n\nGuardado en:\n{file_salida}")
+
+        except Exception as e:
+            self.relleno_log_message(f"❌ Error: {str(e)}")
+            messagebox.showerror("Error", f"Error al procesar el HTML: {str(e)}")
+
     def __del__(self):
-        """Cerrar conexión a la base de datos"""
         if hasattr(self, 'conn'):
             self.conn.close()
 
